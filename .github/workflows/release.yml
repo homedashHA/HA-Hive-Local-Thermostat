@@ -19,8 +19,11 @@ jobs:
 
       - name: "Adjust version number"
         shell: "bash"
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          yq -i -o json '.version="${{ github.event.release.tag_name }}"' \
+          version="${RELEASE_TAG#v}"
+          yq -i -o json --arg version "$version" '.version = $version' \
             "${{ github.workspace }}/custom_components/hive_local_thermostat/manifest.json"
 
       - name: "ZIP the integration directory"

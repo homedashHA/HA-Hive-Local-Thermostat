@@ -1,17 +1,17 @@
 {
   "domain": "hive_local_thermostat",
-  "name": "Hive Local Thermostat",
+  "name": "Hive Local Thermostat (HomeDash)",
   "codeowners": [
-    "@andrew-codechimp"
+    "@homedashHA"
   ],
   "config_flow": true,
   "dependencies": [
     "mqtt"
   ],
-  "documentation": "https://github.com/andrew-codechimp/HA-Hive-Local-Thermostat",
+  "documentation": "https://github.com/homedashHA/HA-Hive-Local-Thermostat",
   "integration_type": "device",
   "iot_class": "calculated",
-  "issue_tracker": "https://github.com/andrew-codechimp/HA-Hive-Local-Thermostat/issues",
+  "issue_tracker": "https://github.com/homedashHA/HA-Hive-Local-Thermostat/issues",
   "requirements": [ ],
-  "version": "2.0.0-dev"
+  "version": "2.1.0"
 }

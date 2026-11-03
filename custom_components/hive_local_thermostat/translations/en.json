@@ -2,7 +2,7 @@
     "config": {
         "step": {
             "user": {
-                "title": "Hive Local Thermostat",
+                "title": "Hive Local Thermostat (HomeDash)",
                 "description": "Enter the entity name and configure parameters.",
                 "data": {
                     "name": "Friendly name",
@@ -22,7 +22,7 @@
     "options": {
         "step": {
             "init": {
-                "title": "Hive Local Thermostat",
+                "title": "Hive Local Thermostat (HomeDash)",
                 "description": "Enter the entity name and configure parameters.",
                 "data": {
                     "mqtt_topic": "MQTT topic",

@@ -36,6 +36,58 @@ PRESET_MAP = {
 }
 
 BOOST_ERROR = 65000
+_HIVE_BOOST_MODE = "emergency_heating"
+
+
+def _optional_int(value: Any) -> int | None:
+    """Return an int from a Zigbee2MQTT field.
+
+    JSON null, a missing value, booleans, and non-numeric strings return None
+    so callers never compare those values with an int.
+    """
+    parsed: int | None = None
+    if isinstance(value, int) and not isinstance(value, bool):
+        parsed = value
+    elif isinstance(value, float):
+        parsed = int(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = int(float(value.strip()))
+        except ValueError:
+            parsed = None
+    return parsed
+
+
+def _reported_boost_minutes(
+    data: dict[str, Any], mode: Any, duration_key: str
+) -> int | None:
+    """Return boost minutes reported by Zigbee2MQTT.
+
+    Inactive boosts are zero. An active boost with a missing, null, or
+    non-numeric duration is None rather than a value that cannot be compared.
+    """
+    if mode != _HIVE_BOOST_MODE:
+        return 0
+    if duration_key not in data:
+        return None
+    return _optional_int(data[duration_key])
+
+
+def _tracked_boost_remaining(
+    started: datetime | None, started_duration: int
+) -> int | None:
+    """Return minutes left on a locally tracked boost, if one was started."""
+    if started is None or started_duration <= 0:
+        return None
+    elapsed_minutes = (utcnow() - started).total_seconds() / 60
+    return max(0, int(started_duration - elapsed_minutes))
+
+
+def _mode_text(mode: Any) -> str:
+    """Return a system mode string, or empty when the payload omitted it."""
+    if isinstance(mode, str):
+        return mode
+    return ""
 
 
 class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -170,21 +222,21 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return
 
             if self.model == MODEL_SLR2:
-                reported_boost_remaining_heat = cast(
-                    int,
-                    parsed_data["temperature_setpoint_hold_duration_heat"]
-                    if parsed_data["system_mode_heat"] == "emergency_heating"
-                    else 0,
+                system_mode_heat = parsed_data.get("system_mode_heat")
+                system_mode_water = parsed_data.get("system_mode_water")
+                reported_boost_remaining_heat = _reported_boost_minutes(
+                    parsed_data,
+                    system_mode_heat,
+                    "temperature_setpoint_hold_duration_heat",
                 )
-                reported_boost_remaining_water = cast(
-                    int,
-                    parsed_data["temperature_setpoint_hold_duration_water"]
-                    if parsed_data["system_mode_water"] == "emergency_heating"
-                    else 0,
+                reported_boost_remaining_water = _reported_boost_minutes(
+                    parsed_data,
+                    system_mode_water,
+                    "temperature_setpoint_hold_duration_water",
                 )
-                reported_boost_temperature = parsed_data[
+                reported_boost_temperature = parsed_data.get(
                     "occupied_heating_setpoint_heat"
-                ]
+                )
                 self.running_state_heat = cast(
                     str,
                     parsed_data.get("running_state_heat")
@@ -197,85 +249,87 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if parsed_data.get("running_state_water")
                     else "preheating",
                 )
-                self.current_temperature = parsed_data["local_temperature_heat"]
-                if parsed_data["occupied_heating_setpoint_heat"] == 1:
+                self.current_temperature = parsed_data.get("local_temperature_heat")
+                heating_setpoint = parsed_data.get("occupied_heating_setpoint_heat")
+                if heating_setpoint == 1:
                     self.target_temperature = self.heating_frost_prevention
                 else:
-                    self.target_temperature = parsed_data[
-                        "occupied_heating_setpoint_heat"
-                    ]
-                self.preset_mode = self.climate_preset(parsed_data["system_mode_heat"])
-                if parsed_data["system_mode_heat"] == "heat":
+                    self.target_temperature = heating_setpoint
+                self.preset_mode = self.climate_preset(_mode_text(system_mode_heat))
+                if system_mode_heat == "heat":
                     if (
-                        parsed_data["temperature_setpoint_hold_heat"] is False
+                        parsed_data.get("temperature_setpoint_hold_heat") is False
                         and self.show_heating_schedule_mode
                     ):
                         self.hvac_mode = HVACMode.AUTO
                     else:
                         self.hvac_mode = HVACMode.HEAT
-                if parsed_data["system_mode_heat"] == "emergency_heating":
+                if system_mode_heat == _HIVE_BOOST_MODE:
                     self.hvac_mode = HVACMode.HEAT
                     self.heat_boost = True
-                if parsed_data["system_mode_heat"] == "off":
+                if system_mode_heat == "off":
                     self.hvac_mode = HVACMode.OFF
 
-                if parsed_data["system_mode_heat"] != "emergency_heating":
+                if system_mode_heat != _HIVE_BOOST_MODE:
                     self.pre_boost_occupied_heating_setpoint_heat = (
                         self.target_temperature
                     )
                     self.pre_boost_hvac_mode = self.hvac_mode
-                if parsed_data["system_mode_water"] == "heat":
-                    if parsed_data["temperature_setpoint_hold_water"] is False:
+                if system_mode_water == "heat":
+                    if parsed_data.get("temperature_setpoint_hold_water") is False:
                         if self.show_water_schedule_mode:
                             self.water_mode = "auto"
                         else:
                             self.water_mode = "heat"
                     else:
                         self.water_mode = "heat"
-                if parsed_data["system_mode_water"] == "emergency_heating":
+                if system_mode_water == _HIVE_BOOST_MODE:
                     self.water_mode = "boost"
                     self.water_boost = True
-                if parsed_data["system_mode_water"] == "off":
+                if system_mode_water == "off":
                     self.water_mode = "off"
 
-                if parsed_data["system_mode_water"] != "emergency_heating":
+                if system_mode_water != _HIVE_BOOST_MODE:
                     self.pre_boost_water_mode = self.water_mode
             else:
-                reported_boost_remaining_heat = cast(
-                    int,
-                    parsed_data["temperature_setpoint_hold_duration"]
-                    if parsed_data["system_mode"] == "emergency_heating"
-                    else 0,
+                system_mode = parsed_data.get("system_mode")
+                reported_boost_remaining_heat = _reported_boost_minutes(
+                    parsed_data,
+                    system_mode,
+                    "temperature_setpoint_hold_duration",
                 )
-                reported_boost_temperature = parsed_data["occupied_heating_setpoint"]
+                reported_boost_temperature = parsed_data.get(
+                    "occupied_heating_setpoint"
+                )
                 self.running_state_heat = cast(
                     str,
                     parsed_data.get("running_state")
                     if parsed_data.get("running_state")
                     else "preheating",
                 )
-                self.current_temperature = parsed_data["local_temperature"]
-                if parsed_data["occupied_heating_setpoint"] == 1:
+                self.current_temperature = parsed_data.get("local_temperature")
+                heating_setpoint = parsed_data.get("occupied_heating_setpoint")
+                if heating_setpoint == 1:
                     self.target_temperature = self.heating_frost_prevention
                 else:
-                    self.target_temperature = parsed_data["occupied_heating_setpoint"]
-                self.preset_mode = self.climate_preset(parsed_data["system_mode"])
+                    self.target_temperature = heating_setpoint
+                self.preset_mode = self.climate_preset(_mode_text(system_mode))
 
-                if parsed_data["system_mode"] == "heat":
+                if system_mode == "heat":
                     if (
-                        parsed_data["temperature_setpoint_hold"] is False
+                        parsed_data.get("temperature_setpoint_hold") is False
                         and self.show_heating_schedule_mode
                     ):
                         self.hvac_mode = HVACMode.AUTO
                     else:
                         self.hvac_mode = HVACMode.HEAT
-                if parsed_data["system_mode"] == "emergency_heating":
+                if system_mode == _HIVE_BOOST_MODE:
                     self.hvac_mode = HVACMode.HEAT
                     self.heat_boost = True
-                if parsed_data["system_mode"] == "off":
+                if system_mode == "off":
                     self.hvac_mode = HVACMode.OFF
 
-                if parsed_data["system_mode"] != "emergency_heating":
+                if system_mode != _HIVE_BOOST_MODE:
                     self.pre_boost_occupied_heating_setpoint_heat = (
                         self.target_temperature
                     )
@@ -314,18 +368,31 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return True
 
     def correct_heat_boost(
-        self, reported_boost_remaining_heat: int, reported_boost_temperature: float
+        self,
+        reported_boost_remaining_heat: int | None,
+        reported_boost_temperature: float | None,
     ) -> bool:
         """Check and correct boost remaining heat if necessary."""
+        if reported_boost_remaining_heat is None:
+            # Zigbee2MQTT often publishes emergency_heating before the hold
+            # duration, or omits it entirely. Keep the locally tracked countdown
+            # and do not republish a boost from a value the device did not send.
+            tracked = _tracked_boost_remaining(
+                self.heat_boost_started, self.heat_boost_started_duration
+            )
+            if tracked is not None:
+                self.heat_boost_remaining = tracked
+            LOGGER.debug(
+                "Heating boost duration was missing from the MQTT payload; using %s minutes remaining",
+                self.heat_boost_remaining,
+            )
+            return False
+
         if reported_boost_remaining_heat > BOOST_ERROR:
-            # Calculate remaining boost time based on when it started
-            if self.heat_boost_started and self.heat_boost_started_duration > 0:
-                elapsed = (utcnow() - self.heat_boost_started).total_seconds() / 60
-                self.heat_boost_remaining = int(
-                    self.heat_boost_started_duration - elapsed
-                )
-            else:
-                self.heat_boost_remaining = 0
+            tracked = _tracked_boost_remaining(
+                self.heat_boost_started, self.heat_boost_started_duration
+            )
+            self.heat_boost_remaining = 0 if tracked is None else tracked
 
             LOGGER.warning(
                 "Correcting reported boost remaining heat from %d to %d",
@@ -343,17 +410,25 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.heat_boost_remaining = reported_boost_remaining_heat
         return False
 
-    def correct_water_boost(self, reported_boost_remaining_water: int) -> bool:
+    def correct_water_boost(self, reported_boost_remaining_water: int | None) -> bool:
         """Check and correct boost remaining water if necessary."""
+        if reported_boost_remaining_water is None:
+            tracked = _tracked_boost_remaining(
+                self.water_boost_started, self.water_boost_started_duration
+            )
+            if tracked is not None:
+                self.water_boost_remaining = tracked
+            LOGGER.debug(
+                "Water boost duration was missing from the MQTT payload; using %s minutes remaining",
+                self.water_boost_remaining,
+            )
+            return False
+
         if reported_boost_remaining_water > BOOST_ERROR:
-            # Calculate remaining boost time based on when it started
-            if self.water_boost_started and self.water_boost_started_duration > 0:
-                elapsed = (utcnow() - self.water_boost_started).total_seconds() / 60
-                self.water_boost_remaining = int(
-                    self.water_boost_started_duration - elapsed
-                )
-            else:
-                self.water_boost_remaining = 0
+            tracked = _tracked_boost_remaining(
+                self.water_boost_started, self.water_boost_started_duration
+            )
+            self.water_boost_remaining = 0 if tracked is None else tracked
 
             LOGGER.warning(
                 "Correcting reported boost remaining water from %d to %d",

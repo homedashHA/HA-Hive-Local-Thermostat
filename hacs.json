@@ -1,5 +1,5 @@
 {
-    "name": "Hive Local Thermostat",
+    "name": "Hive Local Thermostat (HomeDash)",
     "filename": "hive_local_thermostat.zip",
     "hide_default_branch": true,
     "homeassistant": "2025.4.0",

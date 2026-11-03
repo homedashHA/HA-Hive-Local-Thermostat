@@ -1,9 +1,9 @@
 [project]
 name = "ha-hive-local-thermostat"
 version = "0.0.0"
-description = "HA-Hive-Local-Thermostat - Hive Local Thermostat for Home Assistant"
-authors = [{ email = "Andrew Jackson <andrew@codechimp.org>" }]
-maintainers = [{ email = "Andrew Jackson <andrew@codechimp.org>" }]
+description = "Hive Local Thermostat for Home Assistant, maintained by HomeDash"
+authors = [{ name = "Andrew Jackson", email = "andrew@codechimp.org" }]
+maintainers = [{ name = "HomeDash" }]
 
 readme = "README.md"
 license = "MIT"
@@ -19,11 +19,11 @@ requires-python = "==3.13.2"
 dependencies = [] # Use dev for all dependencies
 
 [project.urls]
-documentation = "https://github.com/andrew-codechimp/HA-Hive-Local-Thermostat"
-homepage = "https://github.com/andrew-codechimp/HA-Hive-Local-Thermostat"
-repository = "https://github.com/andrew-codechimp/HA-Hive-Local-Thermostat"
-"Bug Tracker" = "https://github.com/andrew-codechimp/HA-Hive-Local-Thermostat/issues"
-Changelog = "https://github.com/andrew-codechimp/HA-Hive-Local-Thermostat/releases"
+documentation = "https://github.com/homedashHA/HA-Hive-Local-Thermostat"
+homepage = "https://github.com/homedashHA/HA-Hive-Local-Thermostat"
+repository = "https://github.com/homedashHA/HA-Hive-Local-Thermostat"
+"Bug Tracker" = "https://github.com/homedashHA/HA-Hive-Local-Thermostat/issues"
+Changelog = "https://github.com/homedashHA/HA-Hive-Local-Thermostat/releases"
 
 [dependency-groups]
 dev = [

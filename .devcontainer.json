@@ -1,5 +1,5 @@
 {
-  "name": "andrew-codechimp/hive-local-thermostat",
+  "name": "homedashHA/hive-local-thermostat",
   "build": {"dockerfile": "Dockerfile"},
   "remoteUser": "vscode",
   "features": {
