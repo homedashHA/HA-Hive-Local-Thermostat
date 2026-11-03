@@ -24,13 +24,15 @@ jobs:
       - name: Ruff Check
         uses: astral-sh/ruff-action@v3
         with:
-          version-file: "uv.lock"
+          # Keep CI on the Ruff release in uv.lock. The action cannot parse
+          # that lockfile and otherwise installs latest, which enables new rules.
+          version: "0.15.7"
           args: check --output-format=github
 
       - name: Ruff Format
         uses: astral-sh/ruff-action@v3
         with:
-          version-file: "uv.lock"
+          version: "0.15.7"
           args: format --check --diff
 
   mypy:
