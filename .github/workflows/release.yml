@@ -4,6 +4,12 @@ on:
   release:
     types:
       - "published"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the zip to, for example v2.1.0"
+        required: true
+        type: string
 
 permissions: {}
 
@@ -13,26 +19,35 @@ jobs:
     runs-on: "ubuntu-latest"
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
       - name: "Checkout the repository"
         uses: "actions/checkout@v6"
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: "Adjust version number"
         shell: "bash"
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           version="${RELEASE_TAG#v}"
-          yq -i -o json --arg version "$version" '.version = $version' \
-            "${{ github.workspace }}/custom_components/hive_local_thermostat/manifest.json"
+          case "$version" in
+            ""|*[!0-9A-Za-z._+-]*)
+              echo "Refusing to set the manifest version from tag '${RELEASE_TAG}'."
+              exit 1
+              ;;
+          esac
+          yq -i -o json ".version = \"${version}\"" \
+            "${GITHUB_WORKSPACE}/custom_components/hive_local_thermostat/manifest.json"
 
       - name: "ZIP the integration directory"
         shell: "bash"
         run: |
-          cd "${{ github.workspace }}/custom_components/hive_local_thermostat"
+          cd "${GITHUB_WORKSPACE}/custom_components/hive_local_thermostat"
           zip hive_local_thermostat.zip -r ./
 
       - name: "Upload the ZIP file to the release"
         uses: softprops/action-gh-release@v2.6.1
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: ${{ github.workspace }}/custom_components/hive_local_thermostat/hive_local_thermostat.zip
