@@ -89,6 +89,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: HiveConfigEntry) -> bool
         entry.options.get(CONF_SHOW_HEAT_SCHEDULE_MODE, True),
         entry.options.get(CONF_SHOW_WATER_SCHEDULE_MODE, True),
     )
+    await coordinator.async_load_heating_boost_session()
+    entry.async_on_unload(coordinator.async_unload_heating_boost)
 
     platforms = get_platforms(coordinator.model)
 
@@ -125,6 +127,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HiveConfigEntry) -> bool
 
 async def async_unload_entry(hass: HomeAssistant, entry: HiveConfigEntry) -> bool:
     """Handle removal of an entry."""
+    entry.runtime_data.coordinator.async_unload_heating_boost()
     return await hass.config_entries.async_unload_platforms(
         entry, entry.runtime_data.platforms
     )
