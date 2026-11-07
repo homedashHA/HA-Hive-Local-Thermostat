@@ -440,11 +440,14 @@ async def test_explicit_cancel_is_single_and_unknown_snapshot_publishes_nothing(
     await unknown.async_heating_boost(15, 25)
     await unknown.async_heating_boost_cancel()
     await _advance(hass, clock, 20 * 60)
-    assert all(not _turns_heating_off(item) for item in _payloads(published)[before:])
-    assert not any(
-        item.get("occupied_heating_setpoint_heat") == 20
-        for item in _payloads(published)[before:]
-    )
+    assert published[before:] == []
+
+    heat_without_setpoint = _coordinator(hass, entry_id="heat-without-setpoint")
+    heat_without_setpoint.hvac_mode = HVACMode.HEAT
+    before = len(published)
+    await heat_without_setpoint.async_heating_boost(15, 25)
+    await _advance(hass, clock, 20 * 60)
+    assert published[before:] == []
 
 
 async def test_explicit_duration_zero_does_not_start_default_boost(
@@ -802,3 +805,19 @@ async def test_finished_session_is_not_restored_again_after_restart(
     await hass.async_block_till_done()
     await _advance(hass, clock, 60)
     assert published == []
+
+
+def test_storage_keys_cannot_escape_or_collide() -> None:
+    """Device ids cannot share a storage file or leave the storage directory."""
+    home_a = heating_boost_storage_key("home-a")
+    home_b = heating_boost_storage_key("home-b")
+    slash = heating_boost_storage_key("home/a")
+    parent = heating_boost_storage_key("../home-a")
+    assert home_a != home_b
+    assert home_a == "hive_local_thermostat.heating_boost.home-a"
+    assert slash != home_a
+    assert slash != parent
+    for key in (home_a, home_b, slash, parent):
+        assert "/" not in key
+        assert ".." not in key
+        assert key.count(".") == 2

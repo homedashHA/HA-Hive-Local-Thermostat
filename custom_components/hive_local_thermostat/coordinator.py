@@ -38,6 +38,7 @@ from .const import (
 from .heating_boost import (
     HEATING_BOOST_MODE,
     HeatingBoostSession,
+    can_restore_snapshot,
     decide_heating_restore,
     heating_boost_storage_key,
     note_device_report,
@@ -822,6 +823,12 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if snapshot_setpoint is not None
                 else _setpoint_or_none(self.target_temperature)
             )
+            if not can_restore_snapshot(mode, setpoint):
+                LOGGER.warning(
+                    "Not starting a heating boost for %s because the previous mode or setpoint is unknown",
+                    self.entry_id,
+                )
+                return False
             self._heating_session = HeatingBoostSession(
                 entry_id=self.entry_id,
                 pre_boost_hvac_mode=mode,

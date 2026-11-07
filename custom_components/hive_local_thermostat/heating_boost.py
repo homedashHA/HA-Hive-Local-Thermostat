@@ -13,8 +13,8 @@ This does not guarantee the house returns to the previous state:
 - A change made only on the thermostat while no state message arrives can be
   missed. The restore then writes the saved pre-boost setpoint, never the
   boost temperature.
-- Unknown mode or setpoint never turns heating off and never rewrites a
-  setpoint.
+- Unknown mode or setpoint never starts a boost, turns heating off, or
+  rewrites a setpoint.
 - After a restart, nothing is published until a state message for this device
   arrives, and nothing is published unless that message is still the commanded
   boost. A stale or already-changed report is left untouched.
@@ -27,6 +27,8 @@ This does not guarantee the house returns to the previous state:
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -40,9 +42,30 @@ _SETPOINT_TOLERANCE = 0.05
 _MODES = {HVACMode.HEAT, HVACMode.AUTO, HVACMode.OFF}
 
 
+_SAFE_ENTRY_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+
+
 def heating_boost_storage_key(entry_id: str) -> str:
-    """Return the storage key for one config entry."""
-    return f"{DOMAIN}.heating_boost.{entry_id}"
+    """Return one storage file name for one config entry.
+
+    The suffix is a single path segment. Unsafe ids are hashed so two devices
+    cannot share a file or write outside the storage directory.
+    """
+    if _SAFE_ENTRY_ID.fullmatch(entry_id):
+        suffix = entry_id
+    else:
+        digest = hashlib.sha256(entry_id.encode()).hexdigest()[:16]
+        suffix = f"id-{digest}"
+    return f"{DOMAIN}.heating_boost.{suffix}"
+
+
+def can_restore_snapshot(mode: HVACMode | None, setpoint: float | None) -> bool:
+    """Return whether a later restore can undo a boost without guessing."""
+    if mode == HVACMode.AUTO:
+        return True
+    if mode in {HVACMode.HEAT, HVACMode.OFF}:
+        return setpoint is not None
+    return False
 
 
 def resolved_boost_minutes(requested: float | None, default: float) -> int:
