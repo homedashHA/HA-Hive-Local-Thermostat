@@ -32,3 +32,9 @@ DEFAULT_HEATING_BOOST_TEMPERATURE = 25
 DEFAULT_WATER_BOOST_MINUTES = 60
 
 MAXIMUM_BOOST_MINUTES = 180
+
+# Presses closer together than this are one gesture. The reported failure
+# sent three boost commands at 0s, +3s and +4s; a shorter window would still
+# have published the second command.
+HEATING_BOOST_DEBOUNCE_SECONDS = 5
+HEATING_BOOST_STORAGE_VERSION = 1

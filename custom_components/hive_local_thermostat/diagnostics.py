@@ -48,6 +48,7 @@ async def async_get_config_entry_diagnostics(
             "heating_boost_temperature": coordinator.heating_boost_temperature,
             "pre_boost_hvac_mode": coordinator.pre_boost_hvac_mode,
             "pre_boost_occupied_heating_setpoint_heat": coordinator.pre_boost_occupied_heating_setpoint_heat,
+            "heating_boost_session": coordinator.heating_boost_diagnostics(),
             "heating_frost_prevention": coordinator.heating_frost_prevention,
             "water_mode": coordinator.water_mode,
             "water_boost": coordinator.water_boost,

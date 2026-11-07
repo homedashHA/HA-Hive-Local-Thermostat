@@ -118,26 +118,12 @@ class HiveClimateEntity(HiveEntity, ClimateEntity):
         self._attr_preset_mode = preset_mode
 
         if preset_mode == "boost":
-            self.coordinator.pre_boost_hvac_mode = self._attr_hvac_mode
-            self.coordinator.pre_boost_occupied_heating_setpoint_heat = (
-                self._attr_target_temperature
+            await self.coordinator.async_heating_boost(
+                snapshot_mode=self._attr_hvac_mode,
+                snapshot_setpoint=self._attr_target_temperature,
             )
-
-            await self.coordinator.async_heating_boost()
-
-        elif self.coordinator.pre_boost_hvac_mode is not None:
-            if (
-                self.coordinator.pre_boost_hvac_mode == HVACMode.HEAT
-                and self.coordinator.pre_boost_occupied_heating_setpoint_heat
-                is not None
-            ):
-                await self.coordinator.async_set_hvac_mode_heat(
-                    self.coordinator.pre_boost_occupied_heating_setpoint_heat,
-                )
-            else:
-                await self.async_set_hvac_mode(self.coordinator.pre_boost_hvac_mode)
-            self.coordinator.pre_boost_hvac_mode = None
-            self.coordinator.pre_boost_occupied_heating_setpoint_heat = None
+        else:
+            await self.coordinator.async_heating_boost_cancel()
 
         # Write updated temperature to HA state to avoid flapping (MQTT confirmation is slow)
         self.async_write_ha_state()

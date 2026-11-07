@@ -17,23 +17,27 @@ from homeassistant.util.dt import utcnow
 _LOGGER_NAME = "custom_components.hive_local_thermostat"
 
 
-def _message(payload: dict[str, Any]) -> ReceiveMessage:
+def _message(payload: dict[str, Any], *, retain: bool = False) -> ReceiveMessage:
     """Build an MQTT message the coordinator can handle."""
     return ReceiveMessage(
         topic="zigbee2mqtt/HiveReceiver",
         payload=json.dumps(payload),
         qos=0,
-        retain=False,
+        retain=retain,
         subscribed_topic="zigbee2mqtt/HiveReceiver",
         timestamp=0.0,
     )
 
 
-def _coordinator(hass: HomeAssistant, model: str = MODEL_SLR2) -> HiveCoordinator:
+def _coordinator(
+    hass: HomeAssistant,
+    model: str = MODEL_SLR2,
+    entry_id: str = "test-entry",
+) -> HiveCoordinator:
     """Return a coordinator that does not publish MQTT."""
     return HiveCoordinator(
         hass,
-        "test-entry",
+        entry_id,
         model,
         "zigbee2mqtt/HiveReceiver",
         show_heat_schedule_mode=True,

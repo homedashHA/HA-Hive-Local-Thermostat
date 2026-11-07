@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
-from asyncio import sleep
-from datetime import datetime
+from asyncio import Lock, sleep
+from collections.abc import Callable
+from datetime import datetime, timedelta
 from typing import Any, cast
+from uuid import uuid4
 
 from homeassistant.components.climate.const import (
     PRESET_BOOST,
@@ -16,6 +18,8 @@ from homeassistant.components.climate.const import (
 from homeassistant.components.mqtt import client as mqtt_client
 from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_track_point_in_utc_time
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util.dt import utcnow
 
@@ -25,9 +29,20 @@ from .const import (
     DEFAULT_HEATING_BOOST_TEMPERATURE,
     DEFAULT_WATER_BOOST_MINUTES,
     DOMAIN,
+    HEATING_BOOST_DEBOUNCE_SECONDS,
+    HEATING_BOOST_STORAGE_VERSION,
     HIVE_BOOST,
     LOGGER,
     MODEL_SLR2,
+)
+from .heating_boost import (
+    HEATING_BOOST_MODE,
+    HeatingBoostSession,
+    decide_heating_restore,
+    heating_boost_storage_key,
+    note_device_report,
+    resolved_boost_minutes,
+    session_from_storage,
 )
 
 PRESET_MAP = {
@@ -36,7 +51,7 @@ PRESET_MAP = {
 }
 
 BOOST_ERROR = 65000
-_HIVE_BOOST_MODE = "emergency_heating"
+_HIVE_BOOST_MODE = HEATING_BOOST_MODE
 
 
 def _optional_int(value: Any) -> int | None:
@@ -145,6 +160,15 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.show_heating_schedule_mode = show_heat_schedule_mode
         self.show_water_schedule_mode = show_water_schedule_mode
         self.data: dict[str, Any] = {}
+        self._heating_session: HeatingBoostSession | None = None
+        self._heating_state_seen = False
+        self._reported_heat_system_mode: str | None = None
+        self._deadline_unsub: Callable[[], None] | None = None
+        self._boost_store: Store[dict[str, Any]] | None = None
+        self._boost_lock = Lock()
+        self._boost_unloaded = False
+        self._applying_restore = False
+        self._last_heating_boost_at: datetime | None = None
 
     @property
     def topic_get(self) -> str:
@@ -270,11 +294,17 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if system_mode_heat == "off":
                     self.hvac_mode = HVACMode.OFF
 
-                if system_mode_heat != _HIVE_BOOST_MODE:
+                if (
+                    system_mode_heat != _HIVE_BOOST_MODE
+                    and not self._heating_session_is_open()
+                ):
                     self.pre_boost_occupied_heating_setpoint_heat = (
                         self.target_temperature
                     )
                     self.pre_boost_hvac_mode = self.hvac_mode
+                self._remember_heat_mode(
+                    system_mode_heat, parsed_data, retained=message.retain
+                )
                 if system_mode_water == "heat":
                     if parsed_data.get("temperature_setpoint_hold_water") is False:
                         if self.show_water_schedule_mode:
@@ -329,24 +359,33 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if system_mode == "off":
                     self.hvac_mode = HVACMode.OFF
 
-                if system_mode != _HIVE_BOOST_MODE:
+                if (
+                    system_mode != _HIVE_BOOST_MODE
+                    and not self._heating_session_is_open()
+                ):
                     self.pre_boost_occupied_heating_setpoint_heat = (
                         self.target_temperature
                     )
                     self.pre_boost_hvac_mode = self.hvac_mode
+                self._remember_heat_mode(
+                    system_mode, parsed_data, retained=message.retain
+                )
 
-            if self.correct_heat_boost(
+            self.correct_heat_boost(
                 reported_boost_remaining_heat, reported_boost_temperature
-            ):
-                return  # Correction made, exit to avoid state update loop
+            )
             self.record_heat_boost_state()
+            follow_up = self._sync_heating_session_from_report()
+            self._apply_open_heating_session_display()
 
             if self.model == MODEL_SLR2:
                 if self.correct_water_boost(reported_boost_remaining_water):
+                    self._schedule_heating_follow_up(follow_up)
                     return  # Correction made, exit to avoid state update loop
                 self.record_water_boost_state()
 
             self.async_set_updated_data(parsed_data)
+            self._schedule_heating_follow_up(follow_up)
         except json.JSONDecodeError:
             LOGGER.error("Failed to parse JSON from MQTT payload: %s", payload)
         except Exception as err:  # noqa: BLE001
@@ -370,43 +409,29 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def correct_heat_boost(
         self,
         reported_boost_remaining_heat: int | None,
-        reported_boost_temperature: float | None,
+        _reported_boost_temperature: float | None,
     ) -> bool:
-        """Check and correct boost remaining heat if necessary."""
-        if reported_boost_remaining_heat is None:
-            # Zigbee2MQTT often publishes emergency_heating before the hold
-            # duration, or omits it entirely. Keep the locally tracked countdown
-            # and do not republish a boost from a value the device did not send.
+        """Check and correct boost remaining heat if necessary.
+
+        A missing duration and 65535 both mean the receiver is not counting.
+        Neither value starts another boost. The session timer owns the deadline.
+        """
+        if (
+            reported_boost_remaining_heat is None
+            or reported_boost_remaining_heat > BOOST_ERROR
+        ):
             tracked = _tracked_boost_remaining(
                 self.heat_boost_started, self.heat_boost_started_duration
             )
             if tracked is not None:
                 self.heat_boost_remaining = tracked
+            elif reported_boost_remaining_heat is not None:
+                self.heat_boost_remaining = 0
             LOGGER.debug(
-                "Heating boost duration was missing from the MQTT payload; using %s minutes remaining",
-                self.heat_boost_remaining,
+                "Heating boost duration was %s; keeping the local deadline",
+                "missing" if reported_boost_remaining_heat is None else "indefinite",
             )
             return False
-
-        if reported_boost_remaining_heat > BOOST_ERROR:
-            tracked = _tracked_boost_remaining(
-                self.heat_boost_started, self.heat_boost_started_duration
-            )
-            self.heat_boost_remaining = 0 if tracked is None else tracked
-
-            LOGGER.warning(
-                "Correcting reported boost remaining heat from %d to %d",
-                reported_boost_remaining_heat,
-                self.heat_boost_remaining,
-            )
-            if self.config_entry is not None:
-                self.config_entry.async_create_task(
-                    self.hass,
-                    self.async_heating_boost(
-                        self.heat_boost_remaining, reported_boost_temperature
-                    ),
-                )
-            return True
         self.heat_boost_remaining = reported_boost_remaining_heat
         return False
 
@@ -445,7 +470,9 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def record_heat_boost_state(self) -> None:
         """Record and track boost state for heating."""
-        if self.heat_boost and self.heat_boost_remaining > 0:
+        if not self._heating_session_is_open() and (
+            self.heat_boost and self.heat_boost_remaining > 0
+        ):
             # Boost is active, record the start time if not already recorded
             if not self.heat_boost_started:
                 self.heat_boost_started = utcnow()
@@ -532,57 +559,48 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_heating_boost(
         self,
-        boost_duration_minutes: int | None = None,
+        boost_duration_minutes: float | None = None,
         boost_temperature: float | None = None,
+        *,
+        snapshot_mode: HVACMode | None = None,
+        snapshot_setpoint: float | None = None,
     ) -> None:
-        """Send heating boost command."""
-
-        self.pre_boost_occupied_heating_setpoint_heat = self.target_temperature
-        self.pre_boost_hvac_mode = self.hvac_mode
-
-        duration = str(int(boost_duration_minutes or self.heating_boost_duration))
-        temperature = str(boost_temperature or self.heating_boost_temperature)
-
-        if self.model == MODEL_SLR2:
-            payload = (
-                r'{"system_mode_heat":"emergency_heating","temperature_setpoint_hold_duration_heat":'
-                + duration
-                + r',"temperature_setpoint_hold_heat":1,"occupied_heating_setpoint_heat":'
-                + temperature
-                + r"}"
-            )
-        else:
-            payload = (
-                r'{"system_mode":"emergency_heating","temperature_setpoint_hold_duration":'
-                + duration
-                + r',"temperature_setpoint_hold":1,"occupied_heating_setpoint":'
-                + temperature
-                + r"}"
-            )
-
-        self.heat_boost = True
-        self.heat_boost_started = utcnow()
-        self.heat_boost_started_duration = int(duration)
-
-        await self._async_publish_set(payload)
+        """Send one heating boost command and arm its restore deadline."""
+        if self._boost_unloaded:
+            return
+        minutes = resolved_boost_minutes(
+            boost_duration_minutes, self.heating_boost_duration
+        )
+        if minutes == 0:
+            await self._async_finish_heating_boost("duration_0")
+            return
+        if minutes < 0:
+            return
+        temperature = float(
+            self.heating_boost_temperature
+            if boost_temperature is None
+            else boost_temperature
+        )
+        async with self._boost_lock:
+            if not self._prepare_heating_boost(
+                minutes,
+                temperature,
+                snapshot_mode=snapshot_mode,
+                snapshot_setpoint=snapshot_setpoint,
+            ):
+                return
+            await self._async_save_heating_session()
+        await self._async_publish_set(self._heating_boost_payload(minutes, temperature))
+        self.async_update_listeners()
 
     async def async_heating_boost_cancel(self) -> None:
-        """Cancel heating boost command."""
-
-        if self.pre_boost_hvac_mode == HVACMode.AUTO:
-            await self.async_set_hvac_mode_auto()
-        elif self.pre_boost_hvac_mode == HVACMode.HEAT:
-            if self.pre_boost_occupied_heating_setpoint_heat is not None:
-                await self.async_set_hvac_mode_heat(
-                    self.pre_boost_occupied_heating_setpoint_heat
-                )
-            else:
-                await self.async_set_hvac_mode_heat(self.heating_frost_prevention)
-        else:
-            await self.async_set_hvac_mode_off()
+        """End a heating boost this integration started, once, without guessing."""
+        await self._async_finish_heating_boost("cancel")
 
     async def async_set_temperature(self, temperature: float) -> None:
         """Set temperature."""
+        if self._mark_manual_heating_change():
+            await self._async_save_heating_session()
 
         if self.model == MODEL_SLR2:
             payload = r'{"occupied_heating_setpoint_heat":' + str(temperature) + r"}"
@@ -593,6 +611,8 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_set_hvac_mode_off(self) -> None:
         """Set HVAC mode to off."""
+        if self._mark_manual_heating_change():
+            await self._async_save_heating_session()
 
         if self.model == MODEL_SLR2:
             payload = r'{"system_mode_heat":"off","temperature_setpoint_hold_heat":"0"}'
@@ -621,6 +641,8 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_set_hvac_mode_auto(self) -> None:
         """Set HVAC mode to auto."""
+        if self._mark_manual_heating_change():
+            await self._async_save_heating_session()
 
         if self.model == MODEL_SLR2:
             payload = r'{"system_mode_heat":"heat","temperature_setpoint_hold_heat":"0","temperature_setpoint_hold_duration_heat":"0"}'
@@ -636,6 +658,8 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         set_from_temperature: bool = False,  # noqa: FBT001, FBT002
     ) -> None:
         """Set HVAC mode to heat."""
+        if self._mark_manual_heating_change():
+            await self._async_save_heating_session()
 
         if self.model == MODEL_SLR2:
             payload = (
@@ -668,3 +692,376 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not set_from_temperature:
             await sleep(0.5)
             await self._async_publish_set(payload_heating_setpoint)
+
+    def heating_boost_diagnostics(self) -> dict[str, Any] | None:
+        """Return the open or finished heating boost session, without its token."""
+        session = self._heating_session
+        if session is None:
+            return None
+        return {
+            "pre_boost_hvac_mode": (
+                None
+                if session.pre_boost_hvac_mode is None
+                else session.pre_boost_hvac_mode.value
+            ),
+            "pre_boost_setpoint": session.pre_boost_setpoint,
+            "commanded_temperature": session.commanded_temperature,
+            "deadline": session.deadline.isoformat(),
+            "finished": session.finished,
+            "superseded": session.superseded,
+            "loaded_from_storage": session.loaded_from_storage,
+            "saw_commanded_setpoint": session.saw_commanded_setpoint,
+        }
+
+    async def async_load_heating_boost_session(self) -> None:
+        """Load a boost session saved before the last restart."""
+        try:
+            raw = await self._heating_store().async_load()
+        except Exception:  # noqa: BLE001
+            LOGGER.warning(
+                "Heating boost session could not be read for %s",
+                self.entry_id,
+                exc_info=True,
+            )
+            return
+        if raw is None:
+            return
+        try:
+            session = session_from_storage(raw, entry_id=self.entry_id)
+        except ValueError:
+            LOGGER.warning(
+                "Ignoring corrupt heating boost session for %s", self.entry_id
+            )
+            return
+        session.loaded_from_storage = True
+        self._heating_session = session
+        self._mirror_heating_session()
+        if not session.finished:
+            self._arm_heating_deadline()
+
+    @callback
+    def async_unload_heating_boost(self) -> None:
+        """Cancel the restore timer so unload cannot publish later."""
+        self._boost_unloaded = True
+        self._cancel_heating_deadline()
+
+    def _heating_session_is_open(self) -> bool:
+        """Return whether a boost we started is still waiting to finish."""
+        session = self._heating_session
+        return session is not None and not session.finished
+
+    def _heating_store(self) -> Store[dict[str, Any]]:
+        """Return the per-entry session store."""
+        if self._boost_store is None:
+            self._boost_store = Store(
+                self.hass,
+                HEATING_BOOST_STORAGE_VERSION,
+                heating_boost_storage_key(self.entry_id),
+            )
+        return self._boost_store
+
+    def _remember_heat_mode(
+        self, mode: Any, payload: dict[str, Any], *, retained: bool
+    ) -> None:
+        """Remember a heating mode from a payload that contained one.
+
+        After a restart, a retained message can be older than the thermostat.
+        It must not authorize a restore; the next live report does.
+        """
+        key = "system_mode_heat" if self.model == MODEL_SLR2 else "system_mode"
+        if key not in payload:
+            return
+        if (
+            retained
+            and self._heating_session is not None
+            and self._heating_session.loaded_from_storage
+        ):
+            return
+        self._heating_state_seen = True
+        self._reported_heat_system_mode = mode if isinstance(mode, str) else None
+
+    def _mark_manual_heating_change(self) -> bool:
+        """Close an open boost because the user sent a different heating command."""
+        if self._applying_restore:
+            return False
+        session = self._heating_session
+        if session is None or session.finished:
+            return False
+        session.superseded = True
+        session.finished = True
+        self._cancel_heating_deadline()
+        self.heat_boost = False
+        self.heat_boost_remaining = 0
+        return True
+
+    def _prepare_heating_boost(
+        self,
+        minutes: int,
+        temperature: float,
+        *,
+        snapshot_mode: HVACMode | None,
+        snapshot_setpoint: float | None,
+    ) -> bool:
+        """Open or refresh a session. Return whether a command should be published."""
+        now = utcnow()
+        if (
+            self._heating_session_is_open()
+            and self._last_heating_boost_at is not None
+            and (now - self._last_heating_boost_at).total_seconds()
+            < HEATING_BOOST_DEBOUNCE_SECONDS
+        ):
+            LOGGER.debug("Ignoring rapid duplicate heating boost for %s", self.entry_id)
+            return False
+
+        if not self._heating_session_is_open():
+            mode = snapshot_mode if snapshot_mode is not None else self.hvac_mode
+            if mode not in {HVACMode.HEAT, HVACMode.AUTO, HVACMode.OFF}:
+                mode = None
+            setpoint = (
+                _setpoint_or_none(snapshot_setpoint)
+                if snapshot_setpoint is not None
+                else _setpoint_or_none(self.target_temperature)
+            )
+            self._heating_session = HeatingBoostSession(
+                entry_id=self.entry_id,
+                pre_boost_hvac_mode=mode,
+                pre_boost_setpoint=setpoint,
+                commanded_temperature=temperature,
+                duration_minutes=minutes,
+                started_at=now,
+                deadline=now + timedelta(minutes=minutes),
+                token=uuid4().hex,
+            )
+        else:
+            session = self._heating_session
+            assert session is not None
+            session.commanded_temperature = temperature
+            session.duration_minutes = minutes
+            session.started_at = now
+            session.deadline = now + timedelta(minutes=minutes)
+            session.token = uuid4().hex
+            session.saw_commanded_setpoint = False
+            session.loaded_from_storage = False
+
+        self._last_heating_boost_at = now
+        self._mirror_heating_session()
+        self.heat_boost = True
+        self.heat_boost_started = now
+        self.heat_boost_started_duration = minutes
+        self._arm_heating_deadline()
+        self._apply_open_heating_session_display()
+        return True
+
+    def _heating_boost_payload(self, minutes: int, temperature: float) -> str:
+        """Return the single Zigbee2MQTT heating boost document."""
+        duration = str(minutes)
+        target = str(temperature)
+        if self.model == MODEL_SLR2:
+            return (
+                '{"system_mode_heat":"emergency_heating",'
+                '"temperature_setpoint_hold_duration_heat":'
+                + duration
+                + ',"temperature_setpoint_hold_heat":1,'
+                + '"occupied_heating_setpoint_heat":'
+                + target
+                + "}"
+            )
+        return (
+            '{"system_mode":"emergency_heating",'
+            '"temperature_setpoint_hold_duration":'
+            + duration
+            + ',"temperature_setpoint_hold":1,"occupied_heating_setpoint":'
+            + target
+            + "}"
+        )
+
+    def _heating_off_payload(self) -> str:
+        """Return a mode-off document that does not write a setpoint."""
+        if self.model == MODEL_SLR2:
+            return '{"system_mode_heat":"off","temperature_setpoint_hold_heat":"0"}'
+        return '{"system_mode":"off","temperature_setpoint_hold":"0"}'
+
+    def _mirror_heating_session(self) -> None:
+        """Expose the first snapshot on the legacy coordinator attributes."""
+        session = self._heating_session
+        if session is None:
+            return
+        self.pre_boost_hvac_mode = session.pre_boost_hvac_mode
+        self.pre_boost_occupied_heating_setpoint_heat = session.pre_boost_setpoint
+
+    def _sync_heating_session_from_report(self) -> str | None:
+        """Apply the latest device report. Return save, restore, or nothing."""
+        session = self._heating_session
+        if session is None or session.finished:
+            return None
+        if session.loaded_from_storage and not self._heating_state_seen:
+            return None
+        saw_before = session.saw_commanded_setpoint
+        note_device_report(session, _setpoint_or_none(self.target_temperature))
+        if (
+            not session.finished
+            and session.loaded_from_storage
+            and self._heating_state_seen
+            and self._reported_heat_system_mode != _HIVE_BOOST_MODE
+        ):
+            session.finished = True
+        if session.finished:
+            self._cancel_heating_deadline()
+            self.heat_boost = False
+            self.heat_boost_remaining = 0
+            return "save"
+        if (
+            session.loaded_from_storage
+            and self._heating_state_seen
+            and session.deadline <= utcnow()
+            and self._reported_heat_system_mode == _HIVE_BOOST_MODE
+        ):
+            return "restore"
+        if session.saw_commanded_setpoint and not saw_before:
+            return "save"
+        return None
+
+    def _schedule_heating_follow_up(self, action: str | None) -> None:
+        """Persist or restore after the MQTT handler returns."""
+        if action is None or self._boost_unloaded:
+            return
+        self.hass.async_create_task(
+            self._async_heating_follow_up(action),
+            eager_start=False,
+        )
+
+    async def _async_heating_follow_up(self, action: str) -> None:
+        """Run the session follow-up chosen by the device report."""
+        if self._boost_unloaded:
+            return
+        if action == "save":
+            async with self._boost_lock:
+                await self._async_save_heating_session()
+            return
+        if action == "restore":
+            await self._async_finish_heating_boost("restart")
+
+    def _apply_open_heating_session_display(self) -> None:
+        """Show the session deadline while it is still open."""
+        session = self._heating_session
+        if session is None or session.finished:
+            return
+        self.heat_boost = True
+        remaining_minutes = int((session.deadline - utcnow()).total_seconds() // 60)
+        self.heat_boost_remaining = max(remaining_minutes, 0)
+
+    def _arm_heating_deadline(self) -> None:
+        """Schedule the one restore for the current session token."""
+        self._cancel_heating_deadline()
+        session = self._heating_session
+        if session is None or session.finished or self._boost_unloaded:
+            return
+        token = session.token
+        scheduled_for = session.deadline
+
+        @callback
+        def _fired(scheduled: datetime) -> None:
+            current = self._heating_session
+            if (
+                self._boost_unloaded
+                or current is None
+                or current.finished
+                or current.token != token
+                or current.deadline > scheduled + timedelta(seconds=1)
+            ):
+                return
+            self.hass.async_create_task(
+                self._async_finish_heating_boost("deadline"),
+                name=f"{DOMAIN} heating boost deadline {self.entry_id}",
+                eager_start=False,
+            )
+
+        when = max(scheduled_for, utcnow())
+        self._deadline_unsub = async_track_point_in_utc_time(self.hass, _fired, when)
+
+    def _cancel_heating_deadline(self) -> None:
+        """Cancel the armed restore callback."""
+        if self._deadline_unsub is not None:
+            self._deadline_unsub()
+            self._deadline_unsub = None
+
+    async def _async_save_heating_session(self) -> None:
+        """Persist the session. A failure leaves the in-memory decision intact."""
+        session = self._heating_session
+        if session is None:
+            return
+        try:
+            await self._heating_store().async_save(session.to_storage())
+        except Exception:  # noqa: BLE001
+            LOGGER.warning(
+                "Heating boost session could not be saved for %s",
+                self.entry_id,
+                exc_info=True,
+            )
+
+    async def _async_finish_heating_boost(self, reason: str) -> None:
+        """Publish at most one restore, or deliberately publish nothing."""
+        if self._boost_unloaded:
+            return
+        publish: str | None = None
+        restore_setpoint: float | None = None
+        async with self._boost_lock:
+            session = self._heating_session
+            if session is None or session.finished:
+                return
+            action = decide_heating_restore(
+                session,
+                fresh_state_seen=self._heating_state_seen,
+                system_mode=self._reported_heat_system_mode,
+                setpoint=_setpoint_or_none(self.target_temperature),
+            )
+            if action == "wait":
+                LOGGER.debug(
+                    "Heating boost restore for %s is waiting for a device report",
+                    self.entry_id,
+                )
+                return
+            session.finished = True
+            self._cancel_heating_deadline()
+            await self._async_save_heating_session()
+            self.heat_boost = False
+            self.heat_boost_remaining = 0
+            if action == "skip":
+                LOGGER.info(
+                    "Heating boost for %s ended without a device write (%s)",
+                    self.entry_id,
+                    reason,
+                )
+                self.async_update_listeners()
+                return
+            publish = action
+            restore_setpoint = session.pre_boost_setpoint
+        if self._boost_unloaded or publish is None:
+            return
+        self._applying_restore = True
+        try:
+            await self._async_publish_heating_restore(publish, restore_setpoint)
+        finally:
+            self._applying_restore = False
+        self.async_update_listeners()
+
+    async def _async_publish_heating_restore(
+        self, action: str, setpoint: float | None
+    ) -> None:
+        """Publish the pre-boost mode without recreating the boost."""
+        if action == "heat" and setpoint is not None:
+            await self.async_set_hvac_mode_heat(setpoint)
+            return
+        if action == "auto":
+            await self.async_set_hvac_mode_auto()
+            return
+        if action == "off":
+            self.hvac_mode = HVACMode.OFF
+            await self._async_publish_set(self._heating_off_payload())
+
+
+def _setpoint_or_none(value: Any) -> float | None:
+    """Return a setpoint float, or None for missing and boolean values."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
